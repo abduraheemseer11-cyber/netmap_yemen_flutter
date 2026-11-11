@@ -15,3 +15,10 @@
 5. iOS: Info.plist `NSLocationWhenInUseUsageDescription`; AppDelegate: `GMSServices.provideAPIKey("YOUR_MAPS_KEY")`.
 6. Icons: `flutter pub get && dart run flutter_launcher_icons`
 7. `flutter build apk --release`
+
+## CI (GitHub Actions)
+`.github/workflows/build-apk.yml` builds the APK on every push to main.
+Commit `android/` first, then add repository secrets:
+- `GOOGLE_SERVICES_JSON` = `base64 -w0 android/app/google-services.json`
+- `MAPS_API_KEY` = your Google Maps Android key (the manifest must contain the literal `YOUR_MAPS_KEY`)
+Download the APK from Actions > run > Artifacts, or push a tag `v1.0.0` to get a GitHub Release.
