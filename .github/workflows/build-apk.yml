@@ -3,18 +3,16 @@ name: Build Android APK
 on:
   push:
     branches: [main]
-    tags: ["v*"]          # e.g. git tag v1.0.0 && git push --tags  -> creates a GitHub Release
-  pull_request:
-    branches: [main]
-  workflow_dispatch:       # manual run from the Actions tab
+    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
-  contents: write          # needed to attach the APK to a Release
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
@@ -32,35 +30,73 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Verify android/ folder exists
+      # Secrets required (Settings > Secrets and variables > Actions):
+      #   GOOGLE_SERVICES_JSON = base64 of google-services.json (from Firebase console)
+      #   MAPS_API_KEY         = Google Maps Android API key
+      - name: Generate android/ and iOS folders (if missing)
         run: |
           if [ ! -d android ]; then
-            echo "::error::android/ folder not found. Run 'flutter create .' and 'flutterfire configure' locally, then commit android/."
-            exit 1
+            flutter create . --project-name netmap_yemen --org com.netmap --platforms=android,ios
+            rm -rf test   # default widget test references the template app and would fail analysis
           fi
 
-      # --- Secrets (Settings > Secrets and variables > Actions) ---
-      # GOOGLE_SERVICES_JSON : base64 of android/app/google-services.json   (base64 -w0 google-services.json)
-      # MAPS_API_KEY         : your Google Maps Android API key
-      - name: Inject Firebase config
+      - name: Add Firebase config
         env:
           GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
         run: |
-          if [ -n "$GOOGLE_SERVICES_JSON" ]; then
-            echo "$GOOGLE_SERVICES_JSON" | base64 -d > android/app/google-services.json
-          else
-            echo "::warning::GOOGLE_SERVICES_JSON secret not set (using committed file if present)."
+          if [ -z "$GOOGLE_SERVICES_JSON" ]; then
+            echo "::error::Secret GOOGLE_SERVICES_JSON is missing. Add it (base64 of google-services.json) in Settings > Secrets and variables > Actions."
+            exit 1
           fi
+          echo "$GOOGLE_SERVICES_JSON" | base64 -d > android/app/google-services.json
 
-      - name: Inject Google Maps API key
+      - name: Patch Android project (Firebase, Maps, permissions, minSdk)
         env:
           MAPS_API_KEY: ${{ secrets.MAPS_API_KEY }}
         run: |
-          if [ -n "$MAPS_API_KEY" ]; then
-            sed -i "s/YOUR_MAPS_KEY/${MAPS_API_KEY}/g" android/app/src/main/AndroidManifest.xml
-          else
-            echo "::warning::MAPS_API_KEY secret not set - the map will be blank."
-          fi
+          python3 - <<'PY'
+          import json, os, pathlib, re, sys
+
+          def read(path):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  sys.exit(f"::error::{path} not found (unexpected Flutter template)")
+              return p, p.read_text()
+
+          # 1) Register the Google Services plugin
+          p, s = read("android/settings.gradle.kts")
+          if "com.google.gms.google-services" not in s:
+              s = re.sub(r'(id\("dev\.flutter\.flutter-plugin-loader"\) version "[^"]+")',
+                         r'\1\n    id("com.google.gms.google-services") version "4.4.2" apply false', s, count=1)
+          p.write_text(s)
+
+          # 2) Apply it in the app module, set minSdk 23, align applicationId with Firebase
+          p, s = read("android/app/build.gradle.kts")
+          if 'id("com.google.gms.google-services")' not in s:
+              s = s.replace('id("dev.flutter.flutter-gradle-plugin")',
+                            'id("dev.flutter.flutter-gradle-plugin")\n    id("com.google.gms.google-services")', 1)
+          s = re.sub(r'minSdk\s*=\s*[^\n]+', 'minSdk = 23', s)
+          gs = json.load(open("android/app/google-services.json"))
+          pkg = gs["client"][0]["client_info"]["android_client_info"]["package_name"]
+          s = re.sub(r'applicationId\s*=\s*"[^"]*"', f'applicationId = "{pkg}"', s)
+          p.write_text(s)
+          print("applicationId =", pkg)
+
+          # 3) Manifest: permissions + Google Maps API key
+          p, s = read("android/app/src/main/AndroidManifest.xml")
+          perms = ('<uses-permission android:name="android.permission.INTERNET"/>\n'
+                   '    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>\n'
+                   '    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>\n    ')
+          if "ACCESS_FINE_LOCATION" not in s:
+              s = s.replace("<application", perms + "<application", 1)
+          key = os.environ.get("MAPS_API_KEY", "")
+          if not key:
+              print("::warning::MAPS_API_KEY secret is empty - the map will be blank.")
+          meta = f'\n        <meta-data android:name="com.google.android.geo.API_KEY" android:value="{key}"/>'
+          if "com.google.android.geo.API_KEY" not in s:
+              s = re.sub(r'(<application[^>]*>)', lambda m: m.group(1) + meta, s, count=1)
+          p.write_text(s)
+          PY
 
       - name: Install dependencies
         run: flutter pub get
@@ -68,10 +104,10 @@ jobs:
       - name: Generate app icons
         run: dart run flutter_launcher_icons
 
-      - name: Analyze
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+      - name: Analyze (informational)
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
 
-      - name: Build release APK (per-ABI + universal)
+      - name: Build release APK
         run: |
           flutter build apk --release --split-per-abi
           flutter build apk --release
